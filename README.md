@@ -284,7 +284,8 @@ flowchart LR
 控制端和主机都支持 H.265 时，主机自动使用 H.265（与官方主机一致，由主机按双方能力选择；官方 Mac 客户端在 SDP
 中优先列出 H.265）。首次桌面连接会用合成帧探测实际编码能力，并通过 CodecNegotiation 告知客户端。支持 `hevc_nvenc`、
 `libx265`、显式 `UU_VIDEO_ENCODER=vaapi` 的 `hevc_vaapi`；硬件失败先回落软件 HEVC，再回落 H.264。
-`UU_VIDEO_CODEC=h264` 强制使用 H.264。8-bit；真彩 4:4:4 使用 hevc_nvenc `rext` / libx265 `main444-8`。
+`UU_VIDEO_CODEC=h264` 强制使用 H.264。`UU_VIDEO_QUALITY=1..5` 固定画质档位（1 流畅 1M、2 高清 2M、3 超清 8M、4 原画 20M、
+5 自动），覆盖控制端请求，用于无法调整画质的控制端（如 iPad）。8-bit；真彩 4:4:4 使用 hevc_nvenc `rext` / libx265 `main444-8`。
 已用官方 Mac 客户端在 RTX 3090（hevc_nvenc，含 4:4:4）实机验收；libx265、hevc_vaapi 及其他客户端尚未实机验证。
 
 ### VAAPI 硬件编码（显式启用）

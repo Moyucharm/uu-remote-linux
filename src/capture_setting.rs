@@ -170,6 +170,8 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
         return None;
     }
     next.fps = next.fps.clamp(MIN_FPS, MAX_FPS);
+    // UU_VIDEO_QUALITY=1..5 pins the preset for viewers that cannot change 画质 (e.g. Android tablets).
+    if let Some(quality) = quality_override() { next.quality = quality; }
     settings.send_if_modified(|current| if *current != next {
         log::info!("Desktop video settings: fps={} quality={} max_kbps={:?} output={:?} chroma={}", next.fps, next.quality, next.max_kbps(), next.output, next.chroma);
         *current = next; true
@@ -178,6 +180,10 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
     put_bytes(1, header, &mut out);
     put_bytes(2, &[], &mut out); // CaptureSettingResponse without errors: applied
     Some(out)
+}
+
+fn quality_override() -> Option<u64> {
+    std::env::var("UU_VIDEO_QUALITY").ok()?.trim().parse().ok().filter(|q| (QUALITY_FAST..=QUALITY_AUTO).contains(q))
 }
 
 /// Message 7 ScreenSources for the single desktop: native size, scaled choices, current size.
