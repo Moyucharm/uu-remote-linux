@@ -696,14 +696,19 @@ impl WebRtcSession {
                                         }
                                     }
                                 }
-                                if fields.iter().any(|f|f.number==20) {
-                                    static INPUT_SHAPE:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
-                                    if INPUT_SHAPE.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<12 {
-                                        let shape:Vec<(u32,&str,usize)>=fields.iter().map(|f|match &f.value {
-                                            WireValue::Bytes(b)=>(f.number,"bytes",b.len()),
-                                            _=>(f.number,"number",0)
-                                        }).collect();
-                                        log::info!("CONTROL protobuf input field shape: {:?}",shape);
+                                for f in &fields {
+                                    let (20,WireValue::Bytes(b))=(f.number,&f.value) else {continue};
+                                    match crate::touch::decode(b) {
+                                        Some(event) => {
+                                            static RECEIPTS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+                                            if RECEIPTS.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<8 { log::info!("CONTROL input received: kind=touch"); }
+                                            if let Some(session)=message_input_session.as_ref() { session.with_input(|| input_worker.touch_event(&event)); }
+                                        }
+                                        None => {
+                                            // Numbers only: field-20 shapes that are not the known touch event.
+                                            static UNKNOWN:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+                                            if UNKNOWN.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<12 { log::info!("Unknown field-20 input: bytes={}",b.len()); }
+                                        }
                                     }
                                 }
 
@@ -812,6 +817,17 @@ impl WebRtcSession {
                                             }
                                             });}
 
+                                        },
+                                        Ok(crate::control_protocol::ControlMessage::Unsupported(v)) => {
+                                            // Unknown JSON input: action name only (bounded).
+                                            static UNSUPPORTED:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+                                            let n=UNSUPPORTED.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                            let action:String=v.get("action").and_then(|a|a.as_str()).unwrap_or("-").chars().filter(|c|c.is_ascii_alphanumeric()||*c=='_').take(40).collect();
+                                            if n<8 { log::info!("Unsupported CONTROL JSON action={}",action); }
+                                        },
+                                        Err(reason) => {
+                                            static BAD:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+                                            if BAD.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<8 { log::info!("CONTROL JSON rejected: {}",reason); }
                                         },
                                         _ => {}
                                     }

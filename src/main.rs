@@ -18,6 +18,7 @@ mod file_trans;
 mod input;
 mod uinput;
 mod input_mapping;
+mod touch;
 mod port_mapping;
 mod power;
 mod signaling;

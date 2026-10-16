@@ -48,7 +48,7 @@ struct Shortcuts { modifiers: u8, shifted: std::collections::BTreeSet<i32> }
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput> }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<crate::touch::Tracker> }
 
 impl InputInjector {
     pub fn new() -> Self {
@@ -59,7 +59,7 @@ impl InputInjector {
                 Err(e) => { log::warn!("uinput unavailable ({}); using the desktop input path. See README for the udev rule.", e.kind()); None }
             }
         } else { None };
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::detect().unwrap_or(crate::desktop_backend::DesktopBackend::X11), pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()) }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::detect().unwrap_or(crate::desktop_backend::DesktopBackend::X11), pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(crate::touch::Tracker::default()) }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -255,9 +255,27 @@ impl InputInjector {
         }
     }
 
+    /// Native touch (field 20) → uinput multitouch screen. Other backends have no touch path.
+    pub fn touch_event(&self, event: &crate::touch::TouchEvent) {
+        let _serial=self.serial.lock().unwrap();
+        let Some(uinput)=self.uinput.as_ref().filter(|u|u.has_touch()) else {
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) { log::info!("Native touch input ignored: needs the uinput touchscreen"); }
+            return;
+        };
+        let mut tracker=self.touch.lock().unwrap();
+        let changes=tracker.update(event);
+        if changes.is_empty() { return; }
+        let primary=match event { crate::touch::TouchEvent::Fingers(f) => f.first().map(|f|((f.x*crate::uinput::ABS_MAX as f32).round() as i32,(f.y*crate::uinput::ABS_MAX as f32).round() as i32)), _ => None };
+        static AUDIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let result=Self::uinput_result(uinput.touch(&changes,tracker.active(),primary));
+        if AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed) < 4 { log::info!("Touch injection outcome: contacts={} result={}",changes.len(),result); }
+    }
+
     pub fn release_held(&self) {
         let _serial=self.serial.lock().unwrap();
         self.discard_pointer();
+        self.touch.lock().unwrap().reset();
         let mut held=self.held.lock().unwrap();
         if let Some(uinput)=&self.uinput {
             Self::uinput_result(uinput.release_all());

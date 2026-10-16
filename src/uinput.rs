@@ -7,8 +7,8 @@
 //! TAG+="uaccess"` grants the logged-in seat user access (see README).
 //!
 //! Devices: one keyboard + relative mouse, one absolute pointer (ABS_X/ABS_Y 0..=65535 with
-//! buttons and wheels, like a QEMU tablet). Mixing relative and absolute axes in one device
-//! confuses libinput.
+//! buttons and wheels, like a QEMU tablet), one direct multitouch screen (type B slots) for the
+//! viewer's native touch mode. Mixing relative and absolute axes in one device confuses libinput.
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -29,6 +29,12 @@ mod imp {
     const REL_WHEEL: u16 = 0x08;
     const ABS_X: u16 = 0x00;
     const ABS_Y: u16 = 0x01;
+    const ABS_MT_SLOT: u16 = 0x2f;
+    const ABS_MT_POSITION_X: u16 = 0x35;
+    const ABS_MT_POSITION_Y: u16 = 0x36;
+    const ABS_MT_TRACKING_ID: u16 = 0x39;
+    const BTN_TOUCH: u16 = 0x14a;
+    const INPUT_PROP_DIRECT: u16 = 0x01;
     pub const BTN_LEFT: u16 = 0x110;
     pub const BTN_RIGHT: u16 = 0x111;
     pub const BTN_MIDDLE: u16 = 0x112;
@@ -40,6 +46,7 @@ mod imp {
     const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
     const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
     const UI_SET_ABSBIT: libc::c_ulong = 0x4004_5567;
+    const UI_SET_PROPBIT: libc::c_ulong = 0x4004_556e;
     const UI_DEV_CREATE: libc::c_ulong = 0x5501;
     const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
     const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
@@ -74,9 +81,10 @@ mod imp {
             device.ioctl(UI_DEV_CREATE, 0)?;
             Ok(device)
         }
-        fn abs(&self, code: u16) -> std::io::Result<()> {
+        fn abs(&self, code: u16) -> std::io::Result<()> { self.abs_range(code, 0, ABS_MAX) }
+        fn abs_range(&self, code: u16, minimum: i32, maximum: i32) -> std::io::Result<()> {
             self.ioctl(UI_SET_ABSBIT, code.into())?;
-            let setup = UinputAbsSetup { code, _pad: 0, absinfo: AbsInfo { value: 0, minimum: 0, maximum: ABS_MAX, fuzz: 0, flat: 0, resolution: 0 } };
+            let setup = UinputAbsSetup { code, _pad: 0, absinfo: AbsInfo { value: 0, minimum, maximum, fuzz: 0, flat: 0, resolution: 0 } };
             if unsafe { libc::ioctl(self.0.as_raw_fd(), UI_ABS_SETUP, &setup) } < 0 { return Err(std::io::Error::last_os_error()); }
             Ok(())
         }
@@ -92,7 +100,7 @@ mod imp {
         }
     }
 
-    pub struct Devices { keyboard: Mutex<Device>, pointer: Mutex<Device> }
+    pub struct Devices { keyboard: Mutex<Device>, pointer: Mutex<Device>, touch: Option<Mutex<Device>> }
 
     impl Devices {
         pub fn open() -> std::io::Result<Self> {
@@ -116,7 +124,37 @@ mod imp {
                 d.abs(ABS_X)?;
                 d.abs(ABS_Y)
             })?;
-            Ok(Self { keyboard: Mutex::new(keyboard), pointer: Mutex::new(pointer) })
+            // Optional: keyboard/pointer keep working if the touchscreen cannot be created.
+            let touch = Device::create("uu-remote-linux touchscreen", 3, |d| {
+                d.ioctl(UI_SET_PROPBIT, INPUT_PROP_DIRECT.into())?;
+                d.ioctl(UI_SET_EVBIT, EV_KEY.into())?;
+                d.ioctl(UI_SET_KEYBIT, BTN_TOUCH.into())?;
+                d.ioctl(UI_SET_EVBIT, EV_ABS.into())?;
+                d.abs(ABS_X)?;
+                d.abs(ABS_Y)?;
+                d.abs_range(ABS_MT_SLOT, 0, crate::touch::MAX_CONTACTS as i32 - 1)?;
+                d.abs_range(ABS_MT_TRACKING_ID, 0, 0xffff)?;
+                d.abs(ABS_MT_POSITION_X)?;
+                d.abs(ABS_MT_POSITION_Y)
+            }).map_err(|e| log::warn!("uinput touchscreen unavailable ({}); native touch input is ignored", e.kind())).ok();
+            Ok(Self { keyboard: Mutex::new(keyboard), pointer: Mutex::new(pointer), touch: touch.map(Mutex::new) })
+        }
+        pub fn has_touch(&self) -> bool { self.touch.is_some() }
+        /// Type B multitouch frame; `primary` (lowest active slot) drives the single-touch ABS_X/Y.
+        pub fn touch(&self, changes: &[crate::touch::Contact], down: bool, primary: Option<(i32, i32)>) -> std::io::Result<()> {
+            use crate::touch::Contact;
+            let Some(touch) = &self.touch else { return Ok(()) };
+            let mut events = Vec::with_capacity(changes.len() * 4 + 3);
+            for change in changes {
+                match *change {
+                    Contact::Down { slot, tracking, x, y } => events.extend([(EV_ABS, ABS_MT_SLOT, slot as i32), (EV_ABS, ABS_MT_TRACKING_ID, tracking), (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y)]),
+                    Contact::Move { slot, x, y } => events.extend([(EV_ABS, ABS_MT_SLOT, slot as i32), (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y)]),
+                    Contact::Up { slot } => events.extend([(EV_ABS, ABS_MT_SLOT, slot as i32), (EV_ABS, ABS_MT_TRACKING_ID, -1)]),
+                }
+            }
+            events.push((EV_KEY, BTN_TOUCH, i32::from(down)));
+            if let Some((x, y)) = primary { events.extend([(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)]); }
+            touch.lock().unwrap().emit(&events)
         }
         pub fn key(&self, code: u16, pressed: bool) -> std::io::Result<()> {
             self.keyboard.lock().unwrap().emit(&[(EV_KEY, code, i32::from(pressed))])
@@ -129,7 +167,9 @@ mod imp {
             let buttons:Vec<_>=[BTN_LEFT,BTN_RIGHT,BTN_MIDDLE,BTN_SIDE,BTN_EXTRA].into_iter().map(|code|(EV_KEY,code,0)).collect();
             let keyboard=self.keyboard.lock().unwrap().emit(&keys);
             let pointer=self.pointer.lock().unwrap().emit(&buttons);
-            keyboard.and(pointer)
+            let lifted:Vec<crate::touch::Contact>=(0..crate::touch::MAX_CONTACTS).map(|slot|crate::touch::Contact::Up{slot}).collect();
+            let touch=self.touch(&lifted,false,None);
+            keyboard.and(pointer).and(touch)
         }
         pub fn move_absolute(&self, x: i32, y: i32) -> std::io::Result<()> {
             self.pointer.lock().unwrap().emit(&[(EV_ABS, ABS_X, x.clamp(0, ABS_MAX)), (EV_ABS, ABS_Y, y.clamp(0, ABS_MAX))])
@@ -201,6 +241,8 @@ mod imp {
         pub fn move_relative(&self, _: i32, _: i32) -> std::io::Result<()> { Ok(()) }
         pub fn button(&self, _: u16, _: bool) -> std::io::Result<()> { Ok(()) }
         pub fn wheel(&self, _: i32, _: i32) -> std::io::Result<()> { Ok(()) }
+        pub fn has_touch(&self) -> bool { false }
+        pub fn touch(&self, _: &[crate::touch::Contact], _: bool, _: Option<(i32, i32)>) -> std::io::Result<()> { Ok(()) }
     }
 }
 
